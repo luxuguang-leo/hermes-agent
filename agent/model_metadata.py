@@ -32,6 +32,8 @@ def _resolve_requests_verify() -> bool | str:
     that a single env var can cover both `requests` and `httpx` callsites
     inside the same process.
 
+    On macOS/old platforms falls back to ``certifi.where()`` if available.
+
     Returns either a filesystem path to a CA bundle, or True to defer to
     the requests default (certifi).
     """
@@ -39,6 +41,15 @@ def _resolve_requests_verify() -> bool | str:
         val = os.getenv(env_var)
         if val and os.path.isfile(val):
             return val
+    # certifi fallback — covers startup paths where setup_ssl_compat()
+    # wasn't called first (short-lived subprocesses, test fixtures).
+    try:
+        import certifi  # noqa: F811
+        ca = certifi.where()
+        if os.path.isfile(ca):
+            return ca
+    except ImportError:
+        pass
     return True
 
 # Provider names that can appear as a "provider:" prefix before a model ID.

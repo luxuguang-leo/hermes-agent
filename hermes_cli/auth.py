@@ -2692,7 +2692,20 @@ def _default_verify() -> bool | ssl.SSLContext:
     certifi is importable we pin its bundle explicitly; elsewhere we
     defer to httpx's built-in default (certifi via its own dependency).
     Mirrors the weixin fix in 3a0ec1d93.
+
+    Also tries :func:`agent.ssl_compat.resolve_httpx_verify` as a first
+    pass; this respects the ``tls`` config section and env vars set by
+    ``setup_ssl_compat()``.
     """
+    # First pass: let ssl_compat handle config, env vars, and certifi.
+    try:
+        from agent.ssl_compat import resolve_httpx_verify
+        result = resolve_httpx_verify()
+        if result is not True:
+            return result
+    except ImportError:
+        pass
+    # Second pass: legacy fallback for macOS + certifi (pre-ssl_compat).
     if sys.platform == "darwin":
         try:
             import certifi
