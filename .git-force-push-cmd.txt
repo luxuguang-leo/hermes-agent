@@ -1,0 +1,1 @@
+cd ~/.hermes/hermes-agent && git push fork HEAD:fix/feishu-bare-mention --force-with-lease
