@@ -31,6 +31,8 @@ def _build_adapter(extra=None):
     adapter._resolve_source_chat_type = Mock(return_value="group")
     adapter.build_source = Mock(return_value=SimpleNamespace(thread_id=None))
     adapter._dispatch_inbound_event = AsyncMock()
+    adapter._group_rules = {}
+    adapter._require_mention = True
     return adapter
 
 

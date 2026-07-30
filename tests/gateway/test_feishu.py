@@ -2156,6 +2156,7 @@ class TestFeishuPostMentionsBot(unittest.TestCase):
         adapter._bot_open_id = bot_open_id
         adapter._bot_user_id = bot_user_id
         adapter._bot_name = bot_name
+        adapter._group_rules = {}
         return adapter
 
     def test_post_mentions_bot_uses_is_self_flag(self):
@@ -2182,6 +2183,8 @@ class TestFeishuExtractMessageContent(unittest.TestCase):
         adapter._bot_open_id = "ou_bot"
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
+        adapter._group_rules = {}
+        adapter._require_mention = True
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
         return adapter
 
@@ -2216,6 +2219,8 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         adapter._bot_open_id = "ou_bot"
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
+        adapter._group_rules = {}
+        adapter._require_mention = True
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
         adapter._fetch_message_text = AsyncMock(return_value=None)
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
@@ -2301,6 +2306,460 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         self.assertNotIn("[Mentioned:", event.text)
         self.assertTrue(event.text.startswith("/model"))
 
+    def test_mid_text_self_mention_preserved(self):
+        adapter = self._build_adapter()
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "stop pinging @_user_1 please"}),
+            message_type="text",
+            message_id="m4",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m4",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.text, "stop pinging @Hermes please")
+
+    def test_pure_self_mention_message_is_ignored(self):
+        """A message containing only '@Bot' (no body, no media) must not dispatch.
+
+        Regression guard: the rendered '@Hermes' slips past the pre-strip empty
+        guard; the post-strip guard must catch it.
+        """
+        adapter = self._build_adapter()
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1"}),
+            message_type="text",
+            message_id="m5",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message, message=message, sender_id=None,
+                chat_type="group", message_id="m5",
+            )
+        )
+        adapter._dispatch_inbound_event.assert_not_called()
+
+    # ── History backfill tests ──────────────────────────────────────────────
+
+    def test_backfill_fetches_context_when_mentioned_in_group(self):
+        """When @mentioned in a group with backfill default, channel_context is set."""
+        adapter = self._build_adapter()
+        adapter._fetch_feishu_channel_context = AsyncMock(
+            return_value="[Recent channel messages]\n[Alice] hello\n[Bob] world"
+        )
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1 what do you think?"}),
+            message_type="text",
+            message_id="m_b1",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+            root_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m_b1",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertIn("[Recent channel messages]", event.channel_context)
+        self.assertIn("[Alice] hello", event.channel_context)
+        self.assertIn("what do you think?", event.text)
+        self.assertIsNotNone(event.channel_context)  # backfill was set
+
+    def test_backfill_skipped_for_p2p_messages(self):
+        """Backfill must not run for direct messages (p2p)."""
+        adapter = self._build_adapter()
+        adapter._fetch_feishu_channel_context = AsyncMock(return_value="[Recent channel messages]\ndata")
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "hi"}),
+            message_type="text",
+            message_id="m_b2",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+            root_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="p2p",
+                message_id="m_b2",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.text, "hi")
+        adapter._fetch_feishu_channel_context.assert_not_called()
+
+    def test_backfill_skipped_when_no_mentions(self):
+        """Backfill must not run for messages without @mentions when require_mention is true."""
+        adapter = self._build_adapter()
+        adapter._require_mention = True
+        adapter._fetch_feishu_channel_context = AsyncMock(return_value="[Recent channel messages]\ndata")
+        message = SimpleNamespace(
+            content=json.dumps({"text": "hello everyone"}),
+            message_type="text",
+            message_id="m_b3",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+            root_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m_b3",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.text, "hello everyone")
+        adapter._fetch_feishu_channel_context.assert_not_called()
+
+    def test_backfill_runs_in_free_response_group(self):
+        """Backfill runs on every message in free-response groups (require_mention=false)."""
+        adapter = self._build_adapter()
+        adapter._require_mention = False
+        adapter._fetch_feishu_channel_context = AsyncMock(
+            return_value="[Recent channel messages]\n[Alice] hi"
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "hello everyone"}),
+            message_type="text",
+            message_id="m_b4",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            thread_id=None,
+            root_id=None,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="m_b4",
+            )
+        )
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        adapter._fetch_feishu_channel_context.assert_called_once()
+        self.assertIn("[Recent channel messages]", event.channel_context)
+
+
+class TestFeishuBackfillPagination(unittest.TestCase):
+    """Tests for _fetch_feishu_channel_context pagination and response parsing.
+
+    These tests mock the Feishu API layer (self._client.im.v1.message.list)
+    rather than _fetch_feishu_channel_context itself, exercising the full
+    response-parsing, partition, and pagination logic.
+    """
+
+    def _build_adapter(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter.__new__(FeishuAdapter)
+        adapter._bot_open_id = "ou_bot"
+        adapter._bot_user_id = ""
+        adapter._bot_name = "Hermes"
+        adapter._app_id = "app_bot"
+        adapter._client = Mock()
+        adapter._client.im = Mock()
+        adapter._client.im.v1 = Mock()
+        adapter._client.im.v1.message = Mock()
+        adapter._message_text_cache = OrderedDict()
+        return adapter
+
+    def _mock_message(self, msg_id: str, sender_id: str, text: str,
+                      sender_type: str = "user", msg_type: str = "text") -> Mock:
+        msg = Mock()
+        msg.message_id = msg_id
+        msg.msg_type = msg_type
+        msg.sender = Mock()
+        msg.sender.sender_type = sender_type
+        msg.sender.id = sender_id
+        msg.body = Mock()
+        if msg_type == "text":
+            msg.body.content = json.dumps({"text": text})
+        else:
+            # Non-text messages have non-empty content (e.g. image_key for images)
+            msg.body.content = text or f'{{"{msg_type}_key": "{msg_id}"}}'
+        return msg
+
+    def _mock_response(self, items: list, has_more: bool = False,
+                       page_token: str = "") -> Mock:
+        resp = Mock()
+        resp.data = Mock()
+        resp.data.items = items
+        resp.data.has_more = has_more
+        resp.data.page_token = page_token
+        resp.success = Mock(return_value=True)
+        return resp
+
+    def _set_mock_api(self, adapter, responses):
+        """Mock the Feishu API call to return given response(s).
+
+        Uses mock.patch.object on the message.list method so the mock
+        survives any _run_blocking dispatch path.
+        """
+        from unittest.mock import patch
+
+        if isinstance(responses, list):
+            mock_list = AsyncMock(side_effect=responses)
+        else:
+            mock_list = AsyncMock(return_value=responses)
+
+        adapter._client.im.v1.message.list = mock_list
+
+        # _run_blocking calls func(*args) - make it actually invoke
+        # the function so the mock on message.list is reached.
+        async def _run_blocking_through(self_obj, func, *args):
+            return await func(*args)
+
+        adapter._run_blocking = _run_blocking_through.__get__(adapter)
+
+    def test_single_page_basic(self):
+        """Basic single-page fetch works."""
+        adapter = self._build_adapter()
+        msgs = [
+            self._mock_message("m_1", "ou_user1", "hello"),
+            self._mock_message("m_2", "ou_user2", "world"),
+        ]
+        self._set_mock_api(adapter, self._mock_response(msgs))
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertIn("[Recent channel messages]", result)
+        self.assertIn("[user1] hello", result)
+        self.assertIn("[user2] world", result)
+        # Chronological order (API returned newest-first, so user1 is newer)
+        self.assertLess(
+            result.index("[user2] world"),
+            result.index("[user1] hello"),
+        )
+
+    def test_skips_trigger_message(self):
+        """The trigger message (before_message_id) is excluded."""
+        adapter = self._build_adapter()
+        msgs = [
+            self._mock_message("m_trigger", "ou_user1", "skip me"),
+            self._mock_message("m_1", "ou_user2", "keep me"),
+        ]
+        self._set_mock_api(adapter, self._mock_response(msgs))
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertNotIn("skip me", result)
+        self.assertIn("keep me", result)
+
+    def test_stops_at_self_message(self):
+        """Stops collecting at the bot's own message (partition point)."""
+        adapter = self._build_adapter()
+        msgs = [
+            self._mock_message("m_1", "ou_user1", "user message"),
+            self._mock_message("m_2", "app_bot", "bot message", sender_type="app"),
+            self._mock_message("m_3", "ou_user2", "after bot"),
+        ]
+        self._set_mock_api(adapter, self._mock_response(msgs))
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertIn("[user1] user message", result)
+        self.assertNotIn("bot message", result)
+        self.assertNotIn("after bot", result)
+
+    def test_respects_limit(self):
+        """Only collects up to limit messages."""
+        adapter = self._build_adapter()
+        msgs = [self._mock_message(f"m_{i}", f"ou_user{i}", f"msg {i}")
+                for i in range(10)]
+        self._set_mock_api(adapter, self._mock_response(msgs))
+        adapter._feishu_history_backfill_limit = Mock(return_value=3)
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertIn("[user0] msg 0", result)
+        self.assertIn("[user2] msg 2", result)
+        self.assertNotIn("[user3] msg 3", result)
+
+    def test_pagination_multiple_pages(self):
+        """Paginates across multiple API pages."""
+        adapter = self._build_adapter()
+        page1 = [self._mock_message(f"m_{i}", f"ou_user{i}", f"msg {i}")
+                 for i in range(50)]
+        page2 = [self._mock_message(f"m_{i}", f"ou_user{i}", f"msg {i}")
+                 for i in range(50, 80)]
+
+        self._set_mock_api(adapter, [
+            self._mock_response(page1, has_more=True, page_token="tok2"),
+            self._mock_response(page2, has_more=False),
+        ])
+        adapter._feishu_history_backfill_limit = Mock(return_value=80)
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertIn("[user0] msg 0", result)
+        self.assertIn("[user79] msg 79", result)
+        # Verify it actually made 2 API calls
+        assert adapter._client.im.v1.message.list.call_count == 2
+
+    def test_pagination_self_cutoff_across_pages(self):
+        """Self-message cutoff interrupts pagination across pages."""
+        adapter = self._build_adapter()
+        page1 = [self._mock_message(f"m_{i}", f"ou_user{i}", f"msg {i}")
+                 for i in range(10)]
+        # Page 2 has bot's message followed by user messages
+        page2 = [
+            self._mock_message("m_10", "ou_user10", "before bot"),
+            self._mock_message("m_11", "app_bot", "bot stop", sender_type="app"),
+            self._mock_message("m_12", "ou_user12", "after bot"),
+        ]
+
+        self._set_mock_api(adapter, [
+            self._mock_response(page1, has_more=True, page_token="tok2"),
+            self._mock_response(page2, has_more=True, page_token="tok3"),
+        ])
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertIn("[user0] msg 0", result)
+        self.assertIn("[user10] before bot", result)
+        self.assertNotIn("bot stop", result)
+        self.assertNotIn("after bot", result)
+
+    def test_empty_response_returns_empty(self):
+        """API returning no items yields empty string."""
+        adapter = self._build_adapter()
+        self._set_mock_api(adapter, self._mock_response([]))
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertEqual(result, "")
+
+    def test_failed_response_returns_empty(self):
+        """API failure returns empty string."""
+        adapter = self._build_adapter()
+        resp = Mock()
+        resp.success = Mock(return_value=False)
+        self._set_mock_api(adapter, resp)
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertEqual(result, "")
+
+    def test_limit_zero_returns_empty(self):
+        """Configured limit of 0 disables backfill."""
+        adapter = self._build_adapter()
+        adapter._run_blocking = AsyncMock()
+        adapter._feishu_history_backfill_limit = Mock(return_value=0)
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertEqual(result, "")
+        adapter._client.im.v1.message.list.assert_not_called()
+
+    def test_media_messages_included(self):
+        """Image/file/audio/video messages are included with type label."""
+        adapter = self._build_adapter()
+        msgs = [
+            self._mock_message("m_1", "ou_user1", "", msg_type="image"),
+            self._mock_message("m_2", "ou_user2", "", msg_type="audio"),
+        ]
+        self._set_mock_api(adapter, self._mock_response(msgs))
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertIn("(image)", result)
+        self.assertIn("(audio)", result)
+
+    def test_other_app_message_not_partition(self):
+        """Messages from OTHER apps/bots do not act as partition point."""
+        adapter = self._build_adapter()
+        msgs = [
+            self._mock_message("m_1", "ou_user1", "user msg"),
+            self._mock_message("m_2", "app_other", "other bot", sender_type="app"),
+            self._mock_message("m_3", "ou_user2", "older user msg"),
+        ]
+        self._set_mock_api(adapter, self._mock_response(msgs))
+
+        result = asyncio.run(
+            adapter._fetch_feishu_channel_context("oc_chat", "m_trigger")
+        )
+
+        self.assertIn("user msg", result)
+        self.assertIn("older user msg", result)  # other bot does NOT cut off
+
 
 class TestFeishuFetchMessageText(unittest.TestCase):
     def _build_adapter(self):
@@ -2353,6 +2812,8 @@ class TestFeishuMentionEndToEnd(unittest.TestCase):
         adapter._bot_open_id = "ou_bot"
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
+        adapter._group_rules = {}
+        adapter._require_mention = True
         adapter._download_feishu_message_resources = AsyncMock(return_value=([], []))
         adapter._fetch_message_text = AsyncMock(return_value=None)
         adapter.get_chat_info = AsyncMock(return_value={"name": "Test Chat"})
