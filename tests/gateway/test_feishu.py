@@ -2550,11 +2550,9 @@ class TestFeishuBackfillPagination(unittest.TestCase):
     def _set_mock_api(self, adapter, responses):
         """Mock the Feishu API call to return given response(s).
 
-        Uses mock.patch.object on the message.list method so the mock
-        survives any _run_blocking dispatch path.
+        Mocks both _run_blocking (to call through) and the underlying
+        message.list method so the mock is hit regardless of dispatch path.
         """
-        from unittest.mock import patch
-
         if isinstance(responses, list):
             mock_list = AsyncMock(side_effect=responses)
         else:
@@ -2562,12 +2560,12 @@ class TestFeishuBackfillPagination(unittest.TestCase):
 
         adapter._client.im.v1.message.list = mock_list
 
-        # _run_blocking calls func(*args) - make it actually invoke
-        # the function so the mock on message.list is reached.
-        async def _run_blocking_through(self_obj, func, *args):
+        # Replace _run_blocking with a simple call-through so the mock
+        # on message.list is exercised.
+        async def _passthrough(func, *args):
             return await func(*args)
 
-        adapter._run_blocking = _run_blocking_through.__get__(adapter)
+        adapter._run_blocking = _passthrough
 
     def test_single_page_basic(self):
         """Basic single-page fetch works."""
